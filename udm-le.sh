@@ -9,8 +9,6 @@ source /data/udm-le/udm-le.env
 set +a
 
 # Setup additional variables for later
-LEGO_ARGS="--dns ${DNS_PROVIDER} --email ${CERT_EMAIL} --key-type rsa2048"
-LEGO_FORCE_INSTALL=false
 RESTART_SERVICES=false
 
 # Show usage
@@ -19,7 +17,6 @@ usage() {
 	echo "Actions:"
 	echo "  - udm-le.sh create_services: Force (re-)creates systemd service and timer for automated renewal."
 	echo "  - udm-le.sh initial: Generate new certificate and set up cron job to renew at 03:00 each morning."
-	echo "  - udm-le.sh install_lego: Force (re-)installs lego, using LEGO_VERSION from udm-le.env."
 	echo "  - udm-le.sh renew: Renew certificate if due for renewal."
 	echo "  - udm-le.sh update_keystore: Update keystore used by Captive Portal/WiFiman"
 	echo "              with either full certificate chain (if NO_BUNDLE='no') or server certificate only (if NO_BUNDLE='yes')."
@@ -72,7 +69,7 @@ deploy_certs() {
 
 	# Re-write CERT_NAME if it is a wildcard cert. Replace * with _
 	LEGO_CERT_NAME=${CERT_NAME/\*/_}
-	if [ "$(find -L "${UDM_LE_PATH}"/.lego -type f -name "${LEGO_CERT_NAME}".crt -mmin -5)" ]; then
+	if [ "$(find -L "${UDM_LE_PATH}"/.lego -type f -name "${LEGO_CERT_NAME}".crt -mtime -1)" ]; then
 		echo "deploy_certs(): New certificate was generated, time to deploy it"
 
 		cp -f "${UDM_LE_PATH}"/.lego/certificates/"${LEGO_CERT_NAME}".crt "${UBIOS_CONTROLLER_CERT_PATH}"/unifi-core.crt
@@ -150,45 +147,24 @@ update_keystore() {
 	fi
 }
 
-install_lego() {
-	# Check if lego exists already, do nothing
-	if [ ! -f "${LEGO_BINARY}" ] || [ "${LEGO_FORCE_INSTALL}" = true ]; then
-		echo "install_lego(): Attempting lego installation"
+copy_certs() {
+  # Retrieve the certs from an existing source over SSH
+  if [ ! -d "${UDM_LE_PATH}"/.lego/certificates ] ; then
+    mkdir -p "${UDM_LE_PATH}"/.lego/certificates
+  fi
 
-		# Download and extract lego release
-		echo "install_lego(): Downloading lego v${LEGO_VERSION} from ${LEGO_DOWNLOAD_URL}"
-		wget -qO "/tmp/lego_release-${LEGO_VERSION}.tar.gz" "${LEGO_DOWNLOAD_URL}"
-
-		echo "install_lego(): Extracting lego binary from release and placing at ${LEGO_BINARY}"
-		tar -xozvf "/tmp/lego_release-${LEGO_VERSION}.tar.gz" --directory="${UDM_LE_PATH}" lego
-
-		# Verify lego binary integrity
-		echo "install_lego(): Verifying integrity of lego binary"
-		LEGO_HASH=$(sha1sum "${LEGO_BINARY}" | awk '{print $1}')
-		if [ "${LEGO_HASH}" = "${LEGO_SHA1}" ]; then
-			echo "install_lego(): Verified lego v${LEGO_VERSION}:${LEGO_SHA1}"
-			chmod +x "${LEGO_BINARY}"
-		else
-			echo "install_lego(): Verification failure, lego binary sha1 was ${LEGO_HASH}, expected ${LEGO_SHA1}. Cleaning up and aborting"
-			rm -f "${UDM_LE_PATH}/lego" "/tmp/lego_release-${LEGO_VERSION}.tar.gz"
-			exit 1
-		fi
-	else
-		echo "install_lego(): Lego binary is already installed at ${LEGO_BINARY}, no operation necessary"
-	fi
+  # copy certs to the lego path
+  scp -p -i "${UDM_LE_PATH}"/.ssh/${CERT_HOST_SSH_KEY} ${CERT_HOST_SSH}:"${CERT_HOST_PATH}"/"${CERT_NAME}".crt "${UDM_LE_PATH}/.lego/certificates/" \
+  && \
+  scp -p -i "${UDM_LE_PATH}"/.ssh/${CERT_HOST_SSH_KEY} ${CERT_HOST_SSH}:"${CERT_HOST_PATH}"/"${CERT_NAME}".key "${UDM_LE_PATH}/.lego/certificates/"
 }
 
-# Support alternative DNS resolvers
-if [ "${DNS_RESOLVERS}" != "" ]; then
-	LEGO_ARGS="${LEGO_ARGS} --dns.resolvers ${DNS_RESOLVERS}"
-fi
 
 # Support multiple certificate SANs
 for DOMAIN in $(echo $CERT_HOSTS | tr "," "\n"); do
 	if [ -z "$CERT_NAME" ]; then
 		CERT_NAME=$DOMAIN
 	fi
-	LEGO_ARGS="${LEGO_ARGS} -d ${DOMAIN}"
 done
 
 case $1 in
@@ -197,23 +173,16 @@ create_services)
 	create_services
 	;;
 initial)
-	install_lego
 	create_services
 	echo "initial(): Attempting certificate generation"
-	echo "initial(): ${LEGO_BINARY} --path \"${LEGO_PATH}\" ${LEGO_ARGS} --accept-tos run"
-	${LEGO_BINARY} --path "${LEGO_PATH}" ${LEGO_ARGS} --accept-tos run && deploy_certs && restart_services
+	copy_certs && deploy_certs && restart_services
 	echo "initial(): Starting udm-le systemd timer"
 	systemctl start udm-le.timer
 	;;
-install_lego)
-	echo "install_lego(): Forcing installation of lego"
-	LEGO_FORCE_INSTALL=true
-	install_lego
-	;;
 renew)
-	echo "renew(): Attempting certificate renewal"
-	echo "renew(): ${LEGO_BINARY} --path \"${LEGO_PATH}\" ${LEGO_ARGS} renew --days 60"
-	${LEGO_BINARY} --path "${LEGO_PATH}" ${LEGO_ARGS} renew --days 60 && deploy_certs && restart_services
+	echo "renew(): Attempting certificate retrieval"
+	copy_certs && deploy_certs && restart_services
+#	${LEGO_BINARY} --path "${LEGO_PATH}" ${LEGO_ARGS} renew --days 60 && deploy_certs && restart_services
 	;;
 test_deploy)
 	echo "test_deploy(): Attempting to deploy certificate"
